@@ -1,0 +1,99 @@
+# Fully asynchronous LoRA GRPO on ONE RTX 5090 (32 GB) with PrimeIntellect's math-env.
+#
+#   examples/rtx5090-math-env/run-async-1gpu.sh
+#
+# math-env scores a boxed final answer with math-verify, so no model-written code ever runs and
+# the rollout needs no container: the harness runs in the subprocess runtime.
+run:
+  name: math-env-async-1gpu
+  seed: 0
+
+model:
+  # Relative to examples/rtx5090-math-env/ (run-async-1gpu.sh runs from there); download-model.sh
+  # puts the weights here.
+  name: models/gemma-4-E2B-it
+  load_in_4bit: true
+  max_seq_length: 8192
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.0
+  renderer:
+    name: gemma4
+    enable_thinking: false
+
+environment:
+  taskset:
+    # math-env: PrimeIntellect's verifiers v1 math taskset (PrimeIntellect/Hendrycks-Math,
+    # 7474 tasks). Installed onto PYTHONPATH by examples/rtx5090-math-env/setup.sh; `mg-rl` resolves
+    # the id to the `math_env` module. Not the same package as the Hub's v0 `math-env`.
+    id: math-env
+    args:
+      task:
+        # The reference judge is an LLM fallback that runs when math-verify scores 0. It calls
+        # Prime inference with PRIME_API_KEY and is billed per rollout; null keeps scoring
+        # deterministic and offline.
+        judge: null
+  harness:
+    id: "null"              # single-turn chat loop, no tools
+    runtime:
+      # Only the harness's own chat-loop script runs here; the task executes nothing the model
+      # wrote.
+      type: subprocess
+  max_turns: 1
+  max_total_tokens: 8192    # framework-enforced, matches model.max_seq_length
+  multiplex: 4
+
+rollout:
+  num_generations: 8        # G: rollouts per task = GRPO group size
+  groups_per_step: 2        # 16 rows per optimizer step
+  max_concurrent: 16        # bounded by the vLLM KV cache
+  num_epochs: null
+  max_steps: 200
+  sampling:
+    temperature: 1.0
+    max_tokens: 4096
+
+policy:
+  backend: vllm-server
+  args:
+    base_url: http://127.0.0.1:8000
+    logprobs_mode: processed_logprobs
+    timeout_s: 1800
+
+async:
+  max_staleness: 1
+  queue_capacity: 4
+  num_producers: 2
+  drop_zero_std_groups: true
+  publish_retries: 3
+  publish_retry_backoff_s: 2.0
+  max_consecutive_rollout_failures: 5
+  shutdown_timeout_s: 900
+  unload_grace_s: 2
+  eval_every_steps: null
+
+trainer:
+  backend: unsloth-native
+  args:
+    learning_rate: 1.0e-5
+    per_device_train_batch_size: 1
+    loss_type: dapo
+    importance_sampling_level: token
+    scale_rewards: group
+    beta: 0.0
+    epsilon: 0.2
+    epsilon_high: 0.28
+    max_grad_norm: 1.0
+
+logging:
+  output_dir: runs/math-env-async-1gpu   # examples/rtx5090-math-env/runs/
+  wandb: false
+  save_token_ids: true
+
+checkpoint:
+  save_steps: 10
+  keep_last: 2
+
+eval:
+  every_steps: null
